@@ -26,380 +26,369 @@
 #include <app_framework/convert.h>
 #include <app_framework/gui.h>
 #include <app_framework/toolset.h>
+
+#include <ml_head_tracking.h>
 #include <ml_hand_tracking.h>
 #include <ml_perception.h>
 
 #include <imgui.h>
 
 namespace {
-constexpr glm::vec3 KEYPOINT_CUBE_SCALE = glm::vec3(.01f, .01f, .01f);
-constexpr glm::vec3 PARTICLE_SCALE = glm::vec3(.001f, .001f, .001f);
-constexpr glm::vec3 KEYPOINT_LABEL_SCALE = glm::vec3(.000625f, -.000625f, 1.f);
-const double DRAG = .98;
-const double FORCE_SCALE = 1;
-const int N_PARTICLES = 100;
-const float_t SPACE_SCALE = 10;
-float DT = .1;
+    constexpr glm::vec3 PARTICLE_SCALE = glm::vec3(.003f, .003f, .003f);
+    constexpr glm::vec4 PARTICLE_COLOR = glm::vec4(.7f, .7f, .0f,1.f);
 
-constexpr std::array<glm::vec4, MLHandTrackingStaticData_MaxKeyPoints> KEYPOINT_COLORS {{
-  KEYPOINT_COLOR_THUMB, KEYPOINT_COLOR_THUMB, KEYPOINT_COLOR_THUMB, KEYPOINT_COLOR_THUMB,
-  KEYPOINT_COLOR_INDEX, KEYPOINT_COLOR_INDEX, KEYPOINT_COLOR_INDEX, KEYPOINT_COLOR_INDEX,
-  KEYPOINT_COLOR_MIDDLE, KEYPOINT_COLOR_MIDDLE, KEYPOINT_COLOR_MIDDLE, KEYPOINT_COLOR_MIDDLE,
-  KEYPOINT_COLOR_RING, KEYPOINT_COLOR_RING, KEYPOINT_COLOR_RING, KEYPOINT_COLOR_RING,
-  KEYPOINT_COLOR_PINKY, KEYPOINT_COLOR_PINKY, KEYPOINT_COLOR_PINKY, KEYPOINT_COLOR_PINKY,
-  KEYPOINT_COLOR_WRIST, KEYPOINT_COLOR_WRIST, KEYPOINT_COLOR_WRIST,
-  KEYPOINT_COLOR_CENTER,
-  KEYPOINT_COLOR_INDEX,
-  KEYPOINT_COLOR_MIDDLE,
-  KEYPOINT_COLOR_RING,
-  KEYPOINT_COLOR_PINKY
-}};
-}  // namespace
+// Define some physical constants that determine strength of particle-particle, particle-hand, and cloud confinement forces (as well as some other things)
+    const float FORCE_HAND = .5;
+    const float FORCE_INTER = .00001;
+    const float FORCE_CONFINE = .2;
+    const float HAND_SIZE = .1;
+    const int N_PARTICLES = 200;
+    const float_t SPACE_SCALE = .2;
+    const float DT = 0.1;
+    const float THRESH_CONFIDENCE = .2;
 
-float* differential(float v1[], float v2[]){
-  float diff[3] = {v2[0]-v1[0], v2[1]-v1[1], v2[2]-v1[2]};
-  return diff;
-}
-float magnitude(float v[]){
-  return sqrt(pow(v[0],2) + pow(v[1],2) + pow(v[2],2));
-}
-float distance(float v1[], float v2[]){
-  return magnitude(differential(v1, v2));
-}
-float* normalize(float v[], float mult){
-  float m = mult/magnitude(v);
-  float v2[3];
-  for(uint i=0; i<3; i++) v2[i] = v[i]*m;
-  return v2;
-}
-
-class Particle {
-public:
-    float x[3];
-    float v[3] = {0,0,0};
-
-    Particle(){
-      for(uint i=0; i<3; i++) x[i] = SPACE_SCALE*(rand()-.5)*2;
+// Generates random floats between -lim and lim
+    float randf(float lim) {
+        return lim * 2.0 * (rand() / (RAND_MAX + 1.0) - 0.5);
     }
 
-    void boost(float *x2, float *x1){
-      float* diff = differential(x2,x1);
-      float sep = distance(x2, this->x);
-      float* F = normalize(diff, exp(-pow(magnitude(differential(x2,this->x)),2)));
-
-      for(uint i=0; i<3; i++) this->v[i] += F[i]*DT;
-    }
-    void update(){
-      for(uint i=0; i<3; i++){
-        this->x[i] += v[i];
-        this->v[i] *= DRAG;
-      }
-    }
-};
-
-class HandData {
-public:
-    float x[2][28][3];
-
-    MLHandTrackingStaticData hand_static_data_ = {};
-    HandData(){
-      MLHandTrackingStaticDataInit(&hand_static_data_);
+// Function for displaying checkpoints (nuclear option for troubleshooting)
+    void cp(float i) {
+        ALOG(ANDROID_LOG_INFO, "MyTag", "cp:%3.3f", i);
     }
 
-    const MLCoordinateFrameUID &GetHandFrameId(const MLHandTrackingHandType hand_type, const int idx) const {
-      return hand_static_data_.hand_cfuids[hand_type].keypoint_cfuids[idx];
-    }
+    glm::vec3 hand_data_prev;
 
-    void copy(MLSnapshot *snapshot){
-      for(uint hand_type=0; hand_type<2; hand_type++) {
-        for (uint i = 0; i < 2; ++i) {
-          MLTransform keypoint_transform;
-          UNWRAP_MLRESULT(MLSnapshotGetTransform(snapshot, &GetHandFrameId(static_cast<MLHandTrackingHandType>(hand_type), static_cast<MLHandTrackingHandType>(i)),
-                                                 &keypoint_transform));
-          const glm::vec3 joint_position = ml::app_framework::to_glm(
-                  keypoint_transform.position);
-          for (uint k = 0; k < 3; k++) this->x[hand_type][i][k] = joint_position[k];
+// This is where the particle cloud will be centered, initially
+    glm::vec3 origin = glm::vec3(0.0f, 0.0f, -.5f);
+
+// Particle class that holds and updates particle information
+    class Particle {
+    public:
+        using NodePtr = std::shared_ptr<ml::app_framework::Node>;
+        glm::vec3 x;
+        glm::vec3 v;
+        glm::vec3 F;
+        NodePtr obj = ml::app_framework::CreatePresetNode(ml::app_framework::NodeType::Cube);
+
+        Particle() {
+            this->reset();
+            this->zeroF();
         }
-      }
-    }
-};
-HandData* data_prev = new HandData();
 
-class HandTrackingApp : public ml::app_framework::Application {
-public:
-  HandTrackingApp(struct android_app *state)
-      : ml::app_framework::Application(state, USE_GUI), hand_tracker_(ML_INVALID_HANDLE), draw_labels_(false), color_bones_(false) {
-    MLHandTrackingStaticDataInit(&hand_static_data_);
-  }
+        void reset() {
+            this->x = origin;
+            this->x.x += randf(SPACE_SCALE);
+            this->x.y += randf(SPACE_SCALE);
+            this->x.z += randf(SPACE_SCALE);
 
-  void OnStart() override {
-    MLHandTrackingSettings settings;
-    MLHandTrackingSettingsInit(&settings);
-    UNWRAP_MLRESULT(MLHandTrackingCreateEx(&settings, &hand_tracker_));
-    UNWRAP_MLRESULT_FATAL(MLHandTrackingGetStaticData(hand_tracker_, &hand_static_data_));
-    CreateMeshes();
-    GetGui().Show();
-
-    MLHandTrackingData data;
-    MLHandTrackingDataInit(&data);
-    MLSnapshot *snapshot = nullptr;
-    MLPerceptionGetSnapshot(&snapshot);
-    ASSERT_MLRESULT(MLHandTrackingGetData(hand_tracker_, &data));
-    data_prev->copy(snapshot);
-  }
-
-  void OnResume() override {
-    SetColorOverride(color_bones_);
-  }
-
-  void OnStop() override {
-    UNWRAP_MLRESULT(MLHandTrackingDestroy(hand_tracker_));
-    hand_tracker_ = ML_INVALID_HANDLE;
-  }
-
-  void OnUpdate(float) override {
-    if (hand_tracker_ == ML_INVALID_HANDLE) {
-      return;
-    }
-
-    MLHandTrackingData data;
-    MLHandTrackingDataInit(&data);
-    MLSnapshot *snapshot = nullptr;
-    MLPerceptionGetSnapshot(&snapshot);
-
-    ResetDrawFlags();
-
-    ASSERT_MLRESULT(MLHandTrackingGetData(hand_tracker_, &data));
-    UpdateHand(snapshot, data, MLHandTrackingHandType_Left);
-    UpdateHand(snapshot, data, MLHandTrackingHandType_Right);
-
-    UpdateParticles(snapshot);
-
-    data_prev->copy(snapshot);
-
-    MLPerceptionReleaseSnapshot(snapshot);
-
-    UpdateFocusDistance();
-    UpdateGui(data);
-  }
-
-private:
-  using NodePtr = std::shared_ptr<ml::app_framework::Node>;
-  using KeypointsNodeArray = std::array<NodePtr, MLHandTrackingStaticData_MaxKeyPoints>;
-  using KeypointsVec3Array = std::array<glm::vec3, MLHandTrackingStaticData_MaxKeyPoints>;
-
-  std::array<KeypointsNodeArray, MLHandTrackingHandType_Count> hand_labels_;
-  std::array<KeypointsNodeArray, MLHandTrackingHandType_Count> hand_joints_;
-  std::array<Particle*, N_PARTICLES> particles_;
-  std::array<KeypointsVec3Array, MLHandTrackingHandType_Count> hand_keypoints_position_;
-  std::array<HandSkeleton, MLHandTrackingHandType_Count> hand_bones_;
-  MLHandle hand_tracker_ = ML_INVALID_HANDLE;
-  MLHandTrackingStaticData hand_static_data_ = {};
-  bool draw_labels_, color_bones_;
-
-  // Updates focus distance so that MR recordings are better composited, if done
-  void UpdateFocusDistance() {
-    const float dist_l = glm::length(hand_joints_[MLHandTrackingHandType_Left][MLHandTrackingKeyPoint_Hand_Center]->GetLocalTranslation());
-    const float dist_r = glm::length(hand_joints_[MLHandTrackingHandType_Right][MLHandTrackingKeyPoint_Hand_Center]->GetLocalTranslation());
-    const float distance = (dist_l + dist_r) / 2.f;
-    if (distance > 0.f) {
-      auto frame_params = GetFrameParams();
-      frame_params.focus_distance = distance;
-      UpdateFrameParams(frame_params);
-    }
-  }
-
-  void CreateMeshes() {
-    for (uint8_t hand_idx = 0; hand_idx < MLHandTrackingHandType_Count; ++hand_idx) {
-      const MLHandTrackingHandType hand_type = static_cast<MLHandTrackingHandType>(hand_idx);
-      for (uint8_t i = 0; i < MLHandTrackingStaticData_MaxKeyPoints; ++i) {
-        hand_labels_[hand_type][i] = ml::app_framework::CreatePresetNode(ml::app_framework::NodeType::Text);
-        const std::string hand_label = GetHandLabel(hand_type)[0] + std::to_string(i);
-        hand_labels_[hand_type][i]->GetComponent<ml::app_framework::TextComponent>()->SetText(hand_label.c_str());
-        hand_labels_[hand_type][i]->SetLocalScale(KEYPOINT_LABEL_SCALE);
-        GetRoot()->AddChild(hand_labels_[hand_type][i]);
-
-        hand_joints_[hand_type][i] = ml::app_framework::CreatePresetNode(ml::app_framework::NodeType::Cube);
-        auto mat = hand_joints_[hand_type][i]->GetComponent<ml::app_framework::RenderableComponent>()->GetMaterial();
-        auto flat_mat = std::static_pointer_cast<ml::app_framework::FlatMaterial>(mat);
-        flat_mat->SetOverrideVertexColor(color_bones_);
-        flat_mat->SetColor(KEYPOINT_COLORS[i]);
-        hand_joints_[hand_type][i]->SetLocalScale(KEYPOINT_CUBE_SCALE);
-        GetRoot()->AddChild(hand_joints_[hand_type][i]);
-      }
-      hand_bones_[hand_type].Initialize(GetRoot());
-    }
-
-    // Create particles
-    for(uint8_t i=0; i<N_PARTICLES; i++){
-      particles_[i] = new Particle();
-    }
-
-    // Get initial hand state and save it
-    // (used to calculate hand velocity later when hand state is updated)
-    MLHandTrackingData data;
-    MLHandTrackingDataInit(&data);
-    MLSnapshot *snapshot = nullptr;
-    MLPerceptionGetSnapshot(&snapshot);
-
-    ResetDrawFlags();
-
-    ASSERT_MLRESULT(MLHandTrackingGetData(hand_tracker_, &data));
-    data_prev->copy(snapshot);
-  }
-
-  const MLCoordinateFrameUID &GetHandFrameId(const MLHandTrackingHandType hand_type, const int idx) const {
-    return hand_static_data_.hand_cfuids[hand_type].keypoint_cfuids[idx];
-  }
-
-  void UpdateHand(MLSnapshot *snapshot, const MLHandTrackingData &data, MLHandTrackingHandType hand_type) {
-    const MLHandTrackingHandState &hand_state = data.hand_state[hand_type];
-    bool hand_valid = hand_state.hand_confidence > 0;
-    if (hand_valid){
-      for (uint8_t i = 0; i < MLHandTrackingStaticData_MaxKeyPoints; ++i) {
-        if (hand_state.keypoints_mask[i]) {
-          MLTransform keypoint_transform;
-          UNWRAP_MLRESULT(MLSnapshotGetTransform(snapshot, &GetHandFrameId(hand_type, i), &keypoint_transform));
-          const glm::vec3 joint_position = ml::app_framework::to_glm(keypoint_transform.position);
-
-          auto joint = hand_joints_[hand_type][i];
-          joint->SetWorldTranslation(joint_position);
-          joint->SetWorldRotation(ml::app_framework::to_glm(keypoint_transform.rotation));
-          joint->GetComponent<ml::app_framework::RenderableComponent>()->SetVisible(true);
-          hand_keypoints_position_[hand_type][i] = joint_position;
-
-          for(uint j=0; j<3; j++) data_prev->x[hand_type][i][j] = hand_keypoints_position_[hand_type][i][j];
-
-          auto label = hand_labels_[hand_type][i];
-          label->SetWorldTranslation(joint_position);
-          label->GetComponent<ml::app_framework::RenderableComponent>()->SetVisible(draw_labels_);
+            this->v = glm::vec3(0);
+            this->zeroF();
         }
-      }
-    }
-    hand_bones_[hand_type].Update(hand_keypoints_position_[hand_type], hand_valid);
-  }
 
-  void UpdateParticles(MLSnapshot *snapshot){
-    for(uint hand_type=0; hand_type<2; hand_type++) {
-      for (uint8_t i = 0; i < MLHandTrackingStaticData_MaxKeyPoints; ++i) {
-        MLTransform keypoint_transform;
-        UNWRAP_MLRESULT(MLSnapshotGetTransform(snapshot, &GetHandFrameId(static_cast<MLHandTrackingHandType>(hand_type), static_cast<MLHandTrackingHandType>(i)),
-                                               &keypoint_transform));
-        const glm::vec3 joint_position = ml::app_framework::to_glm(keypoint_transform.position);
-
-        float cur[3];
-        for(uint el=0; el<3; el++){
-          cur[el] = joint_position[el];
+        void zeroF() {
+            this->F = glm::vec3(0);
         }
-        for (uint i = 0; i < N_PARTICLES; i++) {
-          particles_[i]->boost(cur, data_prev->x[hand_type][i]);
+
+        void boost(glm::vec3 force) {
+            this->F += force;
         }
-      }
-    }
 
-    for(uint8_t i=0; i<N_PARTICLES; i++){
-      particles_[i]->update();
-    }
-  }
+        float boost_hand(glm::vec3 hand_pos, glm::vec3 hand_vel) {
+            // Make sure that hand_vel is not (0,0,0). Otherwise, the force is undefined
+            // The hand force takes the form of a Gaussian field pointing in the direction of hand velocity
+            float mult = FORCE_HAND * exp(-pow(glm::distance(hand_pos, this->x) / HAND_SIZE, 2));
+            glm::vec3 Fhand = glm::normalize(hand_vel) * mult;
+            this->boost(Fhand);
+            return glm::length(Fhand);
+        }
 
-  void ResetDrawFlags() {
-    for (uint8_t hand_idx = 0; hand_idx < MLHandTrackingHandType_Count; ++hand_idx) {
-      const MLHandTrackingHandType hand_type = static_cast<MLHandTrackingHandType>(hand_idx);
-      for (uint8_t i = 0; i < MLHandTrackingStaticData_MaxKeyPoints; ++i) {
-        hand_joints_[hand_type][i]->GetComponent<ml::app_framework::RenderableComponent>()->SetVisible(false);
-        hand_labels_[hand_type][i]->GetComponent<ml::app_framework::RenderableComponent>()->SetVisible(false);
-      }
-    }
-  }
+        void update(float drag) {
+            /*auto el = this;
+            ALOG(ANDROID_LOG_INFO, "MyTag", "kpt.position = %3.3f, %3.3f, %3.3f kpd.velocity = %3.3f, %3.3f, %3.3f",
+                 el->x.x,
+                 el->x.y,
+                 el->x.z,
+                 el->v.x,
+                 el->v.y,
+                 el->v.z);*/
 
-  static const char *GetHandLabel(const MLHandTrackingHandType &hand_type) {
-    switch (hand_type) {
-      case MLHandTrackingHandType_Left: return "Left";
-      case MLHandTrackingHandType_Right: return "Right";
-      default: return "Invalid hand type";
-    }
-  }
+            // Basic Newtonian stuff
+            this->v += this->F * DT;
+            this->x += this->v * DT;
+            this->v *= drag;
 
-  static std::pair<const char *, const char *> GetKeypointLabel(const MLHandTrackingKeyPoint &keypoint) {
-    switch (keypoint) {
-      case MLHandTrackingKeyPoint_Thumb_Tip: return {"Thumb", "Tip"};
-      case MLHandTrackingKeyPoint_Thumb_IP: return {"Thumb", "IP"};
-      case MLHandTrackingKeyPoint_Thumb_MCP: return {"Thumb", "MCP"};
-      case MLHandTrackingKeyPoint_Thumb_CMC: return {"Thumb", "CMC"};
-      case MLHandTrackingKeyPoint_Index_Tip: return {"Index", "Tip"};
-      case MLHandTrackingKeyPoint_Index_DIP: return {"Index", "DIP"};
-      case MLHandTrackingKeyPoint_Index_PIP: return {"Index", "PIP"};
-      case MLHandTrackingKeyPoint_Index_MCP: return {"Index", "MCP"};
-      case MLHandTrackingKeyPoint_Middle_Tip: return {"Middle", "Tip"};
-      case MLHandTrackingKeyPoint_Middle_DIP: return {"Middle", "DIP"};
-      case MLHandTrackingKeyPoint_Middle_PIP: return {"Middle", "PIP"};
-      case MLHandTrackingKeyPoint_Middle_MCP: return {"Middle", "MCP"};
-      case MLHandTrackingKeyPoint_Ring_Tip: return {"Ring", "Tip"};
-      case MLHandTrackingKeyPoint_Ring_DIP: return {"Ring", "DIP"};
-      case MLHandTrackingKeyPoint_Ring_PIP: return {"Ring", "PIP"};
-      case MLHandTrackingKeyPoint_Ring_MCP: return {"Ring", "MCP"};
-      case MLHandTrackingKeyPoint_Pinky_Tip: return {"Pinky", "Tip"};
-      case MLHandTrackingKeyPoint_Pinky_DIP: return {"Pinky", "DIP"};
-      case MLHandTrackingKeyPoint_Pinky_PIP: return {"Pinky", "PIP"};
-      case MLHandTrackingKeyPoint_Pinky_MCP: return {"Pinky", "MCP"};
-      case MLHandTrackingKeyPoint_Wrist_Center: return {"Wrist", "Center"};
-      case MLHandTrackingKeyPoint_Wrist_Ulnar: return {"Wrist", "Ulnar"};
-      case MLHandTrackingKeyPoint_Wrist_Radial: return {"Wrist", "Radial"};
-      case MLHandTrackingKeyPoint_Hand_Center: return {"Hand", "Center"};
-      case MLHandTrackingKeyPoint_Index_Meta: return {"Index", "Meta"};
-      case MLHandTrackingKeyPoint_Middle_Meta: return {"Middle", "Meta"};
-      case MLHandTrackingKeyPoint_Ring_Meta: return {"Ring", "Meta"};
-      case MLHandTrackingKeyPoint_Pinky_Meta: return {"Pinky", "Meta"};
-      default: return {"", "Invalid keypoint"};
-    }
-  }
+            // Update rendered object
+            this->reposition();
 
-  void SetColorOverride(bool draw_colors) {
-    for (uint8_t hand_idx = 0; hand_idx < MLHandTrackingHandType_Count; ++hand_idx) {
-      const MLHandTrackingHandType hand_type = static_cast<MLHandTrackingHandType>(hand_idx);
-      for (uint8_t i = 0; i < MLHandTrackingStaticData_MaxKeyPoints; ++i) {
-        auto mat = hand_joints_[hand_type][i]->GetComponent<ml::app_framework::RenderableComponent>()->GetMaterial();
-        auto flat_mat = std::static_pointer_cast<ml::app_framework::FlatMaterial>(mat);
-        flat_mat->SetOverrideVertexColor(draw_colors);
-      }
-      hand_bones_[hand_type].SetColorOverride(draw_colors);
-    }
-  }
+            // Set force to zero in preparation for next timestep where forces will be recalculated
+            this->zeroF();
+        }
 
-  void UpdateGui(const MLHandTrackingData &data) {
-    auto &gui = GetGui();
-    gui.BeginUpdate();
-    if (gui.BeginDialog("HandTracking")) {
-      ImGui::Checkbox("Show keypoint labels", &draw_labels_);
-      if (ImGui::Checkbox("Color fingers", &color_bones_)) {
-        SetColorOverride(color_bones_);
-      }
-      if (ImGui::CollapsingHeader("MLHandTrackingData", ImGuiTreeNodeFlags_DefaultOpen)) {
-        for (uint8_t hand_idx = 0; hand_idx < MLHandTrackingHandType_Count; ++hand_idx) {
-          const MLHandTrackingHandType hand_type = static_cast<MLHandTrackingHandType>(hand_idx);
-          const auto &state = data.hand_state[hand_type];
-          const char *hand_label = GetHandLabel(hand_type);
-          if (ImGui::BeginChild(hand_label, ImVec2(ImGui::GetWindowContentRegionWidth() * 0.5f, 0.f)) &&
-              ImGui::CollapsingHeader(hand_label, ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::Value("Hand confidence", state.hand_confidence, "%.2f");
-            if (ImGui::TreeNodeEx("Keypoints mask")) {
-              for (int point = 0; point < MLHandTrackingStaticData_MaxKeyPoints; ++point) {
-                const auto label = GetKeypointLabel(static_cast<MLHandTrackingKeyPoint>(point));
-                ImGui::Text("[%2d] %-6s %-6s: %s", point, label.first, label.second,
-                            state.keypoints_mask[point] ? "true" : "false");
-              }
-              ImGui::TreePop();
+        void reposition() {
+            // Update the position of particle in the node tree
+            this->obj->SetWorldTranslation(this->x);
+        }
+    };
+
+    // The Swarm class holds all particles and gets angry if you try to grab it with 2 hands
+    class Swarm {
+    public:
+        using Node = ml::app_framework::Node;
+        std::array<Particle *, N_PARTICLES> particles;
+        Particle *origin;
+        float anger = 0.199f;
+        float angerOff = 0.2f;
+        float drag_particle_baseline = 0.98;
+        float drag_particle_angry = 1;
+        float drag_swarm_baseline = 0.992;
+        float drag_swarm_angry = .994;
+        float anger_decay = .999;
+        float F_anger_thresh = 0.49; // Hand force above which the swarm is angered
+        float chaos_swarm = 0.06;
+        float chaos_particle = 0.1;
+
+        Swarm(const std::shared_ptr<Node> root) {
+            // Create particles
+            for (uint8_t i = 0; i < N_PARTICLES; i++) {
+                // The Particle class holds and updates particle data
+                this->particles[i] = new Particle();
+                this->create_mesh(root, this->particles[i]);
             }
-          }
-          ImGui::EndChild();
-          ImGui::SameLine();
+            // Let the entire particle cloud act as a particle that can move around
+            this->origin = new Particle();
+            this->origin->x = ::origin; // x is initially randomized for a Particle, but we want it to be placed at the origin for the cloud
         }
-      }
-    }
-    gui.EndDialog();
-    gui.EndUpdate();
-  }
-};
+
+        void create_mesh(std::shared_ptr<Node> root, Particle* p) {
+            // The following will create the particle on the node tree
+            // Each particle is a cube with some default texture
+            // Ideally it would be rendered using a low-level shader, enabling me to add a lot more particles
+            p->obj->GetComponent<ml::app_framework::RenderableComponent>()->SetVisible(true);
+            auto mat = p->obj->GetComponent<ml::app_framework::RenderableComponent>()->GetMaterial();
+            auto flat_mat = std::static_pointer_cast<ml::app_framework::FlatMaterial>(mat);
+            flat_mat->SetOverrideVertexColor(true);
+            flat_mat->SetColor(PARTICLE_COLOR);
+            p->obj->SetLocalScale(PARTICLE_SCALE);
+            root->AddChild(p->obj);
+        }
+
+        void force_hand(glm::vec3 pos, glm::vec3 vel){
+            // Add hand force to each particle
+            // Add the same force to the entire system (cloud_origin)
+            //float Fmax = 0;
+            if (glm::length(vel) > 0) {
+                for (uint i = 0; i < N_PARTICLES; i++) {
+                    float Fcur = this->particles[i]->boost_hand(pos, vel);
+                    if(Fcur > this->F_anger_thresh) this->anger = 1.0;
+                    //if(Fcur > Fmax) Fmax = Fcur;
+                    this->origin->boost(this->particles[i]->F / float(N_PARTICLES * 2));
+                }
+            }
+            //ALOG(ANDROID_LOG_INFO, "MyTag", "anger = %3.2f", this->anger);
+        }
+
+        void force_head(glm::vec3 pos){
+            /*auto el = pos;
+            auto el2 = this->origin->x;
+            ALOG(ANDROID_LOG_INFO, "MyTag", "anger=%3.3f, v1 = %3.3f, %3.3f, %3.3f v2 = %3.3f, %3.3f, %3.3f",
+                 float(pow(this->anger,2)),
+                 el.x,
+                 el.y,
+                 el.z,
+                 el2.x,
+                 el2.y,
+                 el2.z);*/
+            // If the angering just happened, then the swarm lunges away
+            // After that, it comes at the user's head.
+            // Note that the force magnitude is not dependent on distance to user
+            if(this->anger == 1.0)
+                this->origin->boost( -.4f*glm::normalize(pos - this->origin->x));
+            else if(this->anger > this->angerOff)
+                this->origin->boost(glm::normalize(pos - this->origin->x) * 0.02f);
+        }
+
+        void force_other(){
+            // Calculate inter-particle repulsive force
+            for (uint8_t i = 1; i < N_PARTICLES; i++) {
+                for (uint8_t j = 0; j < i; j++) {
+                    glm::vec3 rad = this->particles[i]->x - this->particles[j]->x;
+                    float denom = pow(glm::length(rad), 3);
+                    glm::vec3 Finter = rad * FORCE_INTER / denom;
+                    this->particles[i]->boost(Finter);
+                    this->particles[j]->boost(-Finter);
+                }
+            }
+
+            // Calculate cloud confinement force
+            // Update each particle's velocities and positions
+            for (uint8_t i = 0; i < N_PARTICLES; i++) {
+                this->particles[i]->boost(FORCE_CONFINE * (this->origin->x - this->particles[i]->x));
+                if(this->anger > angerOff)
+                    this->particles[i]->boost(this->chaos_particle * glm::vec3(randf(1.f), randf(1.f), randf(1.f)));
+            }
+
+            // Make the origin move chaotically in proportion to anger
+            if(this->anger > angerOff)
+                this->origin->boost(this->chaos_swarm * glm::vec3(randf(1.f), randf(1.f), randf(1.f)));
+        }
+
+        // Functions for calculating drag coefficients
+        float drag_particle(){
+            return this->drag_particle_angry*this->anger + this->drag_particle_baseline*(1-this->anger);
+        }
+        float drag_swarm(){
+            return this->drag_swarm_angry*this->anger + this->drag_swarm_baseline*(1-this->anger);
+        }
+
+        // Time update function
+        void update(){
+            // Update particles
+            for (uint8_t i = 0; i < N_PARTICLES; i++) {
+                // The Particle class holds and updates particle data
+                this->particles[i]->update(this->drag_particle());
+            }
+
+            this->origin->update(this->drag_swarm());
+
+            this->anger *= this->anger_decay;
+        }
+    };
+
+    class HandTrackingApp : public ml::app_framework::Application {
+    public:
+        HandTrackingApp(struct android_app *state)
+                : ml::app_framework::Application(state), hand_tracker_(ML_INVALID_HANDLE),
+                  draw_labels_(false), color_bones_(false) {
+            MLHandTrackingStaticDataInit(&hand_static_data_);
+        }
+
+        void OnStart() override {
+            MLHandTrackingSettings settings;
+            MLHandTrackingSettingsInit(&settings);
+            UNWRAP_MLRESULT(MLHandTrackingCreateEx(&settings, &hand_tracker_));
+            UNWRAP_MLRESULT_FATAL(MLHandTrackingGetStaticData(hand_tracker_, &hand_static_data_));
+
+            hand_data_prev = glm::vec3(0);
+
+            MLHeadTrackingStateExInit(&prev_head_state_);
+            UNWRAP_MLRESULT(MLHeadTrackingCreate(&head_tracker_));
+            UNWRAP_MLRESULT(MLHeadTrackingGetStaticData(head_tracker_, &head_static_data_));
+
+            swarm = new Swarm(GetRoot());
+        }
+
+        void OnResume() override {
+            //SetColorOverride(color_bones_);
+        }
+
+        void OnStop() override {
+            UNWRAP_MLRESULT(MLHandTrackingDestroy(hand_tracker_));
+            hand_tracker_ = ML_INVALID_HANDLE;
+
+            UNWRAP_MLRESULT(MLHeadTrackingDestroy(head_tracker_));
+            head_tracker_ = ML_INVALID_HANDLE;
+        }
+
+        void OnUpdate(float) override {
+            if (hand_tracker_ == ML_INVALID_HANDLE || head_tracker_ == ML_INVALID_HANDLE) {
+                return;
+            }
+
+            // MLHandTrackingData object will tell whether data was collected
+            MLHandTrackingData data;
+            MLHandTrackingDataInit(&data);
+            // MLSnapshot object is a timestamp that we use to extract cached data later
+            MLSnapshot *snapshot = nullptr;
+            MLPerceptionGetSnapshot(&snapshot);
+
+            ASSERT_MLRESULT(MLHandTrackingGetData(hand_tracker_, &data));
+
+            MLHeadTrackingStateEx cur_state;
+            MLHeadTrackingStateExInit(&cur_state);
+            UNWRAP_MLRESULT(MLHeadTrackingGetStateEx(head_tracker_, &cur_state));
+
+            if (!initial_state_logged_ || prev_head_state_.status != cur_state.status ||
+                prev_head_state_.error != cur_state.error ||
+                std::fabs(prev_head_state_.confidence - cur_state.confidence) > 0.3f) {
+                    initial_state_logged_ = true;
+            }
+            prev_head_state_ = cur_state;
+
+            // I copied/modified UpdateHand to collect similar information and use it to update particle velocities
+            UpdateParticles(snapshot, data);
+
+            MLPerceptionReleaseSnapshot(snapshot);
+        }
+
+    private:
+        using NodePtr = std::shared_ptr<ml::app_framework::Node>;
+        using KeypointsNodeArray = std::array<NodePtr, MLHandTrackingStaticData_MaxKeyPoints>;
+        using KeypointsVec3Array = std::array<glm::vec3, MLHandTrackingStaticData_MaxKeyPoints>;
+
+        std::array<KeypointsNodeArray, MLHandTrackingHandType_Count> hand_joints_;
+        std::array<KeypointsVec3Array, MLHandTrackingHandType_Count> hand_keypoints_position_;
+        std::array<HandSkeleton, MLHandTrackingHandType_Count> hand_bones_;
+        MLHandle hand_tracker_ = ML_INVALID_HANDLE;
+        MLHandTrackingStaticData hand_static_data_ = {};
+        bool draw_labels_, color_bones_;
+        std::vector<uint8_t> active_joints = {MLHandTrackingKeyPoint_Hand_Center};
+
+        Swarm* swarm;
+
+        MLHandle head_tracker_;
+        MLHeadTrackingStaticData head_static_data_;
+        bool initial_state_logged_ = false;
+        MLHeadTrackingStateEx prev_head_state_;
+
+        const MLCoordinateFrameUID &
+        GetHandFrameId(const MLHandTrackingHandType hand_type, const int idx) const {
+            return hand_static_data_.hand_cfuids[hand_type].keypoint_cfuids[idx];
+        }
+
+        void UpdateParticles(MLSnapshot *snapshot, const MLHandTrackingData &data) {
+            MLTransform head_transform = {};
+            UNWRAP_MLRESULT(MLSnapshotGetTransform(snapshot, &head_static_data_.coord_frame_head, &head_transform));
+            UNWRAP_MLRESULT(MLPerceptionReleaseSnapshot(snapshot));
+            const glm::vec3 head_pos = ml::app_framework::to_glm(head_transform.position);
+
+            // For each hand...
+            for (uint8_t hand_type = 0; hand_type < 2; hand_type++) {
+                // ...get hand state
+                const MLHandTrackingHandState &hand_state = data.hand_state[hand_type];
+                // Check that hand data was collected
+                if (hand_state.hand_confidence > THRESH_CONFIDENCE) {
+                    // For each hand joint... (actually I'm only going to do this for one joint to speed things up)
+                    for (uint8_t i = 0; i < active_joints.size(); i++) {
+                        // ...check that hand joint data was collected
+                        if (hand_state.keypoints_mask[active_joints[i]]) {
+                            // Get hand data for a particular joint (Hand_Center) given the current snapshot (snapshot is just a timestamp)
+                            MLTransform keypoint_transform;
+                            MLSnapshotGetTransform(snapshot, &GetHandFrameId(
+                                                           static_cast<MLHandTrackingHandType>(hand_type),
+                                                           active_joints[i]),
+                                                   &keypoint_transform);
+
+                            // Convert to vec3 and calculate velocity based on previous hand position
+                            const glm::vec3 pos = ml::app_framework::to_glm(keypoint_transform.position);
+                            const glm::vec3 vel = pos - hand_data_prev;
+
+                            swarm->force_hand(pos, vel);
+
+                            // Save current position as previous position
+                            hand_data_prev = pos;
+                        }
+                    }
+                }
+            }
+
+            swarm->force_head(head_pos);
+
+            swarm->force_other();
+            swarm->update();
+        }
+    };
+}
 
 void android_main(struct android_app *state) {
   HandTrackingApp app(state);
